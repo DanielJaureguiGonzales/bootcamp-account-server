@@ -12,6 +12,10 @@ public record AccountResponse(
         String accountNumber,
         String accountType,
         BigDecimal balance,
+        LocalDateTime openingDate,
+        Boolean flagFreeCommisionMant,
+        Integer maxMovMon,
+        LocalDateTime initialDate,
         Boolean status
 ) {
 }

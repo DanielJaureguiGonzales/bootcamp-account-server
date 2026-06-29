@@ -11,6 +11,11 @@ import java.util.List;
 @Repository
 public interface AccountParticipantRepository extends ReactiveMongoRepository<AccountParticipant, String> {
 
+    Flux<AccountParticipant> findByAccountIdAndStatus(
+            String accountId,
+            Boolean status
+    );
+
     Flux<AccountParticipant> findByCustomerIdAndStatus(
             String customerId,
             Boolean status

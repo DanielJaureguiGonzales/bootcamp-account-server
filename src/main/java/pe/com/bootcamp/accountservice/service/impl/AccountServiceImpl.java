@@ -2,7 +2,6 @@ package pe.com.bootcamp.accountservice.service.impl;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.lang.NonNull;
 import org.springframework.stereotype.Service;
 import pe.com.bootcamp.accountservice.dto.*;
 import pe.com.bootcamp.accountservice.exceptions.BusinessValidationException;
@@ -22,8 +21,6 @@ import reactor.core.publisher.Mono;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -211,6 +208,93 @@ public class AccountServiceImpl implements AccountService {
                                                 ))
                                 )
                 );
+    }
+
+    @Override
+    public Mono<Void> deleteAccount(AccountDeleteRequest request) {
+        return validateDeleteAccountRequest(request)
+                .then(client.getCustomerResponseByCustomer(
+                        request.documentNumber(),
+                        request.documentType()
+                ))
+                .switchIfEmpty(Mono.error(new ResourceNotFoundException(
+                        "Customer",
+                        "documentNumber",
+                        request.documentNumber()
+                )))
+                .flatMap(customerResponse ->
+                        accountRepository
+                                .findByAccountNumberAndStatus(
+                                        request.accountNumber(),
+                                        true
+                                )
+                                .switchIfEmpty(Mono.error(new ResourceNotFoundException(
+                                        "Account",
+                                        "accountNumber",
+                                        request.accountNumber()
+                                )))
+                                .flatMap(account ->
+                                        validateCustomerCanDeleteAccount(
+                                                account,
+                                                customerResponse.id()
+                                        ).thenReturn(account)
+                                )
+                )
+                .flatMap(this::deleteAccountAndParticipants);
+    }
+
+    private Mono<Void> deleteAccountAndParticipants(Account account) {
+
+        account.setStatus(false);
+
+        return accountRepository.save(account)
+                .thenMany(accountParticipantRepository.findByAccountIdAndStatus(
+                        account.getAccountId(),
+                        true
+                ))
+                .flatMap(participant -> {
+                    participant.setStatus(false);
+                    return accountParticipantRepository.save(participant);
+                })
+                .then();
+    }
+
+    private Mono<Void> validateDeleteAccountRequest(AccountDeleteRequest request) {
+
+        Map<String, String> errors = new HashMap<>();
+
+        validateDocument(
+                errors,
+                "documentType",
+                "documentNumber",
+                request.documentType(),
+                request.documentNumber()
+        );
+
+        if (!errors.isEmpty()) {
+            return Mono.error(new BusinessValidationException(errors));
+        }
+
+        return Mono.empty();
+    }
+
+    private Mono<Void> validateCustomerCanDeleteAccount(
+            Account account,
+            String customerId
+    ) {
+
+        return accountParticipantRepository
+                .existsByAccountIdAndCustomerIdAndParticipantRoleInAndStatus(
+                        account.getAccountId(),
+                        customerId,
+                        List.of("HOLDER"),
+                        true
+                )
+                .filter(Boolean::booleanValue)
+                .switchIfEmpty(Mono.error(new RuntimeException(
+                        "Only account holder can delete this account"
+                )))
+                .then();
     }
 
     private Mono<OperationCompleted> withDrawOperation(
@@ -627,11 +711,6 @@ public class AccountServiceImpl implements AccountService {
 
         Map<String, String> errors = new HashMap<>();
 
-        if (request == null) {
-            errors.put("request", "Account request is required");
-            return Mono.error(new BusinessValidationException(errors));
-        }
-
         validateDocument(
                 errors,
                 "documentType",
@@ -642,7 +721,6 @@ public class AccountServiceImpl implements AccountService {
 
         validateAccountType(errors, request.accountType());
         validateInitialAmount(errors, request.initialAmount());
-        /*validateFixedTermDate(errors, request);*/
 
         validateParticipants(errors, request);
 
@@ -656,11 +734,6 @@ public class AccountServiceImpl implements AccountService {
     private Mono<Void> validateBalanceRequest(BalanceRequest request) {
 
         Map<String, String> errors = new HashMap<>();
-
-        if (request == null) {
-            errors.put("request", "Balance request is required");
-            return Mono.error(new BusinessValidationException(errors));
-        }
 
         validateDocument(
                 errors,
@@ -683,10 +756,6 @@ public class AccountServiceImpl implements AccountService {
 
         Map<String, String> errors = new HashMap<>();
 
-        if (request == null) {
-            errors.put("request", "Account transactions request is required");
-            return Mono.error(new BusinessValidationException(errors));
-        }
 
         validateDocument(
                 errors,
@@ -696,9 +765,7 @@ public class AccountServiceImpl implements AccountService {
                 request.documentNumber()
         );
 
-        if (request.accountNumber() == null || request.accountNumber().isBlank()) {
-            errors.put("accountNumber", "Account number is required");
-        }
+
 
         if (!errors.isEmpty()) {
             return Mono.error(new BusinessValidationException(errors));
@@ -714,10 +781,6 @@ public class AccountServiceImpl implements AccountService {
 
         Map<String, String> errors = new HashMap<>();
 
-        if (request == null) {
-            errors.put("request", "Operation request is required");
-            return Mono.error(new BusinessValidationException(errors));
-        }
 
         validateDocument(
                 errors,
@@ -727,15 +790,6 @@ public class AccountServiceImpl implements AccountService {
                 request.documentNumber()
         );
 
-        if (request.accountNumber() == null || request.accountNumber().isBlank()) {
-            errors.put("accountNumber", "Account number is required");
-        }
-
-        if (request.amount() == null) {
-            errors.put("amount", "Amount is required");
-        } else if (request.amount().compareTo(BigDecimal.ZERO) <= 0) {
-            errors.put("amount", "Amount must be greater than zero");
-        }
 
         if (idOperation == null || idOperation.isBlank()) {
             errors.put("operation", "Operation is required");
@@ -895,33 +949,6 @@ public class AccountServiceImpl implements AccountService {
         }
     }
 
-    /*private void validateFixedTermDate(
-            Map<String, String> errors,
-            AccountRequest request
-    ) {
-
-        if (!ACCOUNT_TYPE_FIXED_TERM.equals(normalize(request.accountType()))) {
-            return;
-        }
-
-        if (request.initialDate() == null || request.initialDate().isBlank()) {
-            errors.put(
-                    "initialDate",
-                    "Initial date is required for fixed term accounts"
-            );
-            return;
-        }
-
-        try {
-            LocalDate.parse(request.initialDate(), FIXED_TERM_DATE_FORMATTER);
-        } catch (DateTimeParseException ex) {
-            errors.put(
-                    "initialDate",
-                    "Initial date must have format dd/MM/yyyy"
-            );
-        }
-    }*/
-
     private void validateParticipantRole(
             Map<String, String> errors,
             String participantRoleField,
@@ -950,6 +977,10 @@ public class AccountServiceImpl implements AccountService {
                 .accountNumber(account.getAccountNumber())
                 .accountType(account.getAccountType())
                 .balance(account.getBalance())
+                .openingDate(account.getOpeningDate())
+                .flagFreeCommisionMant(account.getFlagFreeCommisionMant())
+                .maxMovMon(account.getMaxMovMon())
+                .initialDate(account.getInitialDate())
                 .status(account.getStatus())
                 .build();
     }

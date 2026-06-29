@@ -15,4 +15,7 @@ public interface AccountService {
     Mono<AccountTransactionsResponse> getAccountTransactions(
             AccountTransactionsRequest request
     );
+
+    Mono<Void> deleteAccount(AccountDeleteRequest  request);
+
 }

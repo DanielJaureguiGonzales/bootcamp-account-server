@@ -12,7 +12,7 @@ import reactor.core.publisher.Mono;
 import java.util.List;
 
 @RestController
-@RequestMapping("/api/account")
+@RequestMapping("/api/accounts")
 @RequiredArgsConstructor
 public class AccountController {
 
@@ -36,13 +36,21 @@ public class AccountController {
                         .body(operationCompleted));
     }
 
-    @GetMapping
+    @GetMapping("/document")
     private Mono<ResponseEntity<List<AccountResponse>>> getAccountByDocumentNumber(@RequestParam("document-number") String documentNumber,@RequestParam("document-type") String documentType){
         return accountService.getAccountByDocumentNumber(documentNumber,documentType).collectList().map( accountResponse ->  ResponseEntity.status(HttpStatus.OK)
                 .body(accountResponse));
     }
 
-    @PostMapping("/balances")
+    @DeleteMapping
+    public Mono<ResponseEntity<Void>> deleteAccount(
+            @RequestBody @Valid AccountDeleteRequest request
+    ) {
+        return accountService.deleteAccount(request)
+                .then(Mono.fromSupplier(() -> ResponseEntity.noContent().build()));
+    }
+
+    @GetMapping("/balances")
     public Mono<ResponseEntity<AccountBalancesResponse>> getAccountBalances(
             @RequestBody BalanceRequest request
     ) {
@@ -50,7 +58,7 @@ public class AccountController {
                 .map(ResponseEntity::ok);
     }
 
-    @PostMapping("/transactions")
+    @GetMapping("/transactions")
     public Mono<ResponseEntity<AccountTransactionsResponse>> getAccountTransactions(
             @RequestBody @Valid AccountTransactionsRequest request
     ) {
