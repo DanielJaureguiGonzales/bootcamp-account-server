@@ -2,7 +2,6 @@ package pe.com.bootcamp.accountservice.service.rest;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.http.HttpEntity;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import pe.com.bootcamp.accountservice.dto.*;
@@ -29,6 +28,14 @@ public class CustomerResponseClient {
 
     public Mono<CustomerResponse> getCustomerResponseByCustomer(String documentNumber, String documentType){
         return customerClient.getCustomerResponse(documentNumber, documentType)
+                .onErrorMap(
+                        WebClientResponseException.NotFound.class,
+                        exception -> new ResourceNotFoundException(
+                                "Customer",
+                                "documentNumber",
+                                documentNumber
+                        )
+                )
                 .switchIfEmpty(Mono.error(new ResourceNotFoundException(
                         "Customer",
                         "documentNumber",
