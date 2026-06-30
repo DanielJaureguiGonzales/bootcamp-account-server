@@ -3,10 +3,26 @@ package pe.com.bootcamp.accountservice.service.impl;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
-import pe.com.bootcamp.accountservice.dto.*;
+import pe.com.bootcamp.accountservice.dto.AccountBalancesResponse;
+import pe.com.bootcamp.accountservice.dto.AccountDeleteRequest;
+import pe.com.bootcamp.accountservice.dto.AccountParticipantRequest;
+import pe.com.bootcamp.accountservice.dto.AccountRequest;
+import pe.com.bootcamp.accountservice.dto.AccountResponse;
+import pe.com.bootcamp.accountservice.dto.AccountTransactionsRequest;
+import pe.com.bootcamp.accountservice.dto.AccountTransactionsResponse;
+import pe.com.bootcamp.accountservice.dto.AccountValidationResult;
+import pe.com.bootcamp.accountservice.dto.BalanceRequest;
+import pe.com.bootcamp.accountservice.dto.CustomerResponse;
+import pe.com.bootcamp.accountservice.dto.CustomerSummaryResponse;
+import pe.com.bootcamp.accountservice.dto.DocumentNumbersRequest;
+import pe.com.bootcamp.accountservice.dto.OperationCompleted;
+import pe.com.bootcamp.accountservice.dto.OperationRequest;
 import pe.com.bootcamp.accountservice.exceptions.BusinessValidationException;
 import pe.com.bootcamp.accountservice.exceptions.ResourceNotFoundException;
-import pe.com.bootcamp.accountservice.generator.AccountNumberGenerator;
+import pe.com.bootcamp.accountservice.factory.AccountFactory;
+import pe.com.bootcamp.accountservice.factory.AccountParticipantFactory;
+import pe.com.bootcamp.accountservice.factory.TransactionFactory;
+import pe.com.bootcamp.accountservice.mapper.AccountMapper;
 import pe.com.bootcamp.accountservice.model.Account;
 import pe.com.bootcamp.accountservice.model.AccountParticipant;
 import pe.com.bootcamp.accountservice.model.Transaction;
@@ -19,8 +35,6 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
-import java.time.LocalDate;
-import java.time.LocalDateTime;
 import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -36,16 +50,31 @@ public class AccountServiceImpl implements AccountService {
     private final AccountParticipantRepository accountParticipantRepository;
     private final TransactionRepository transactionsRepository;
     private final CustomerResponseClient client;
-    private final AccountNumberGenerator accountNumberGenerator;
 
+    private final AccountFactory accountFactory;
+    private final TransactionFactory transactionFactory;
+    private final AccountParticipantFactory accountParticipantFactory;
+
+    private final AccountMapper accountMapper;
 
     @Override
     public Mono<AccountResponse> createAccountCustomer(AccountRequest accountRequest) {
 
+        log.info(
+                "Starting account creation. documentType={}, documentNumber={}, accountType={}",
+                accountRequest.documentType(),
+                maskValue(accountRequest.documentNumber()),
+                accountRequest.accountType()
+        );
+
         return validateAccountRequest(accountRequest)
                 .then(client.getCustomerResponse(accountRequest))
                 .doOnNext(customerResponse ->
-                        log.info("Petición de cliente recibido {}", customerResponse)
+                        log.info(
+                                "Customer retrieved for account creation. customerId={}, documentType={}",
+                                customerResponse.id(),
+                                customerResponse.documentType()
+                        )
                 )
                 .flatMap(customerResponse ->
                         validateAccountByCustomerType(customerResponse, accountRequest)
@@ -57,7 +86,36 @@ public class AccountServiceImpl implements AccountService {
                                         )
                                 )
                 )
-                .map(this::toAccountResponse);
+                .map(accountMapper::toAccountResponse)
+                .doOnSuccess(response ->
+                        log.info(
+                                "Account created successfully. accountId={}, accountNumber={}, accountType={}",
+                                response.accountId(),
+                                maskValue(response.accountNumber()),
+                                response.accountType()
+                        )
+                )
+                .doOnError(BusinessValidationException.class, error ->
+                        log.warn(
+                                "Account creation rejected by validation. documentType={}, documentNumber={}, accountType={}",
+                                accountRequest.documentType(),
+                                maskValue(accountRequest.documentNumber()),
+                                accountRequest.accountType()
+                        )
+                )
+                .doOnError(ResourceNotFoundException.class, error ->
+                        log.warn(
+                                "Account creation rejected because customer was not found. documentType={}, documentNumber={}",
+                                accountRequest.documentType(),
+                                maskValue(accountRequest.documentNumber())
+                        )
+                )
+                .doOnError(error ->
+                        logUnexpectedError(
+                                "Unexpected error creating account",
+                                error
+                        )
+                );
     }
 
     @Override
@@ -65,58 +123,153 @@ public class AccountServiceImpl implements AccountService {
             OperationRequest operationRequest,
             String idOperation
     ) {
+        String operation = normalize(idOperation);
+
+        log.info(
+                "Starting account transaction. operation={}, documentType={}, documentNumber={}, accountNumber={}",
+                operation,
+                operationRequest.documentType(),
+                maskValue(operationRequest.documentNumber()),
+                maskValue(operationRequest.accountNumber())
+        );
+
 
         return validateOperationRequest(operationRequest, idOperation)
-                .then(client.getCustomerResponseByCustomer(
+                .then(getAccountAccessContext(
                         operationRequest.documentNumber(),
-                        operationRequest.documentType()
-                ))
-                .flatMap(customerResponse -> {
+                        operationRequest.documentType(),
+                        operationRequest.accountNumber(),
+                        List.of(ROLE_HOLDER, ROLE_AUTHORIZED_SIGNER),
+                        "Customer is not allowed to operate this account"
+                )).flatMap(context ->
+                        applyTransactionOperation(
+                                operationRequest,
+                                context.account(),
+                                operation,
+                                context.customer().id()
+                        )
+                )
+                .doOnSuccess(response ->
+                        log.info(
+                                "Account transaction completed successfully. operation={}, accountId={}, customerId={}",
+                                response.operation(),
+                                response.accountId(),
+                                response.customerId()
+                        )
+                )
+                .doOnError(BusinessValidationException.class, error ->
+                        log.warn(
+                                "Account transaction rejected by validation. operation={}, documentType={}, documentNumber={}, accountNumber={}",
+                                operation,
+                                operationRequest.documentType(),
+                                maskValue(operationRequest.documentNumber()),
+                                maskValue(operationRequest.accountNumber())
+                        )
+                )
+                .doOnError(ResourceNotFoundException.class, error ->
+                        log.warn(
+                                "Account transaction rejected because resource was not found. operation={}, accountNumber={}",
+                                operation,
+                                maskValue(operationRequest.accountNumber())
+                        )
+                )
+                .doOnError(error ->
+                        logUnexpectedError(
+                                "Unexpected error processing account transaction",
+                                error
+                        )
+                );
+    }
 
-                    String operation = normalize(idOperation);
 
-                    return accountRepository
-                            .findByAccountNumberAndStatus(
-                                    operationRequest.accountNumber(),
-                                    true
-                            )
-                            .switchIfEmpty(Mono.error(new ResourceNotFoundException(
-                                    "Account",
-                                    "accountNumber",
-                                    operationRequest.accountNumber()
-                            )))
-                            .flatMap(account ->
-                                    validateCustomerCanOperateAccount(
-                                            account,
-                                            customerResponse.id()
-                                    ).thenReturn(account)
-                            )
-                            .flatMap(account -> switch (operation) {
-                                case OPERATION_DEPOSIT -> depositOperation(
-                                        operationRequest,
-                                        account,
-                                        operation,
-                                        customerResponse.id()
-                                );
+    private Mono<Account> findActiveAccountByNumber(String accountNumber) {
 
-                                case OPERATION_WITHDRAW -> withDrawOperation(
-                                        operationRequest,
-                                        account,
-                                        operation,
-                                        customerResponse.id()
-                                );
+        return accountRepository.findByAccountNumberAndStatus(accountNumber, true)
+                .switchIfEmpty(Mono.error(new ResourceNotFoundException(
+                        "Account",
+                        "accountNumber",
+                        accountNumber
+                )));
+    }
 
-                                default -> Mono.error(new RuntimeException(
-                                        "Invalid Operation Id " + idOperation
-                                ));
-                            });
+    private Mono<CustomerResponse> findCustomerByDocument(
+            String documentNumber,
+            String documentType
+    ) {
+
+        return client.getCustomerResponseByCustomer(documentNumber, documentType)
+                .switchIfEmpty(Mono.error(new ResourceNotFoundException(
+                        "Customer",
+                        "documentNumber",
+                        documentNumber
+                )));
+    }
+
+    private Mono<OperationCompleted> applyTransactionOperation(
+            OperationRequest operationRequest,
+            Account account,
+            String operation,
+            String customerId
+    ) {
+
+        BigDecimal currentBalance = account.getBalance();
+
+        return calculateNewBalance(
+                currentBalance,
+                operationRequest.amount(),
+                operation
+        )
+                .flatMap(newBalance -> {
+                    account.setBalance(newBalance);
+
+                    return saveTransaction(
+                            operationRequest,
+                            account,
+                            operation,
+                            customerId
+                    );
                 });
     }
 
-    @Override
-    public Flux<AccountResponse> getAccountByDocumentNumber(
-            String documentNumber,
-            String documentType
+    private Mono<BigDecimal> calculateNewBalance(
+            BigDecimal currentBalance,
+            BigDecimal amount,
+            String operation
+    ) {
+
+        return switch (operation) {
+            case OPERATION_DEPOSIT -> Mono.just(
+                    currentBalance.add(amount)
+            );
+
+            case OPERATION_WITHDRAW -> calculateWithdrawBalance(
+                    currentBalance,
+                    amount
+            );
+
+            default -> Mono.error(new RuntimeException(
+                    "Invalid operation: " + operation
+            ));
+        };
+    }
+
+    private Mono<BigDecimal> calculateWithdrawBalance(
+            BigDecimal currentBalance,
+            BigDecimal amount
+    ) {
+
+        if (amount.compareTo(currentBalance) > 0) {
+            return Mono.error(new RuntimeException(
+                    "Insufficient balance"
+            ));
+        }
+
+        return Mono.just(currentBalance.subtract(amount));
+    }
+
+    private Mono<Void> validateDocumentRequest(
+            String documentType,
+            String documentNumber
     ) {
 
         Map<String, String> errors = new HashMap<>();
@@ -130,27 +283,124 @@ public class AccountServiceImpl implements AccountService {
         );
 
         if (!errors.isEmpty()) {
-            return Flux.error(new BusinessValidationException(errors));
+            return Mono.error(new BusinessValidationException(errors));
         }
 
-        return client.getCustomerResponseByCustomer(documentNumber, documentType)
-                .flatMapMany(customerResponse ->
-                        findActiveAccountsByCustomerId(customerResponse.id())
+        return Mono.empty();
+    }
+
+    private Mono<Void> validateCustomerHasRoleInAccount(
+            Account account,
+            String customerId,
+            List<String> allowedRoles,
+            String errorMessage
+    ) {
+
+        return accountParticipantRepository
+                .existsByAccountIdAndCustomerIdAndParticipantRoleInAndStatus(
+                        account.getAccountId(),
+                        customerId,
+                        allowedRoles,
+                        true
                 )
-                .map(this::toAccountResponse);
+                .filter(Boolean::booleanValue)
+                .switchIfEmpty(Mono.error(new RuntimeException(errorMessage)))
+                .then();
+    }
+
+    private Mono<AccountAccessContext> getAccountAccessContext(
+            String documentNumber,
+            String documentType,
+            String accountNumber,
+            List<String> allowedRoles,
+            String errorMessage
+    ) {
+
+        return findCustomerByDocument(documentNumber, documentType)
+                .flatMap(customerResponse ->
+                        findActiveAccountByNumber(accountNumber)
+                                .flatMap(account ->
+                                        validateCustomerHasRoleInAccount(
+                                                account,
+                                                customerResponse.id(),
+                                                allowedRoles,
+                                                errorMessage
+                                        ).thenReturn(new AccountAccessContext(
+                                                customerResponse,
+                                                account
+                                        ))
+                                )
+                );
+    }
+
+    @Override
+    public Flux<AccountResponse> getAccountByDocumentNumber(
+            String documentNumber,
+            String documentType
+    ) {
+
+        log.info(
+                "Starting accounts search by customer document. documentType={}, documentNumber={}",
+                documentType,
+                maskValue(documentNumber)
+        );
+
+        return validateDocumentRequest(documentType, documentNumber)
+                .thenMany(findCustomerByDocument(documentNumber, documentType)
+                        .flatMapMany(customerResponse ->
+                                findActiveAccountsByCustomerId(customerResponse.id())
+                        )
+                .map(accountMapper::toAccountResponse))
+                .doOnComplete(() ->
+                        log.info(
+                                "Accounts search by customer document completed. documentType={}, documentNumber={}",
+                                documentType,
+                                maskValue(documentNumber)
+                        )
+                )
+                .doOnError(BusinessValidationException.class, error ->
+                        log.warn(
+                                "Accounts search rejected by document validation. documentType={}, documentNumber={}",
+                                documentType,
+                                maskValue(documentNumber)
+                        )
+                )
+                .doOnError(ResourceNotFoundException.class, error ->
+                        log.warn(
+                                "Accounts search rejected because customer was not found. documentType={}, documentNumber={}",
+                                documentType,
+                                maskValue(documentNumber)
+                        )
+                )
+                .doOnError(error ->
+                        logUnexpectedError(
+                                "Unexpected error searching accounts by customer document",
+                                error
+                        )
+                );
+
     }
 
     @Override
     public Mono<AccountBalancesResponse> getAccountBalances(BalanceRequest request) {
 
-        return validateBalanceRequest(request)
-                .then(client.getCustomerResponseByCustomer(
+        log.info(
+                "Starting account balances search. documentType={}, documentNumber={}",
+                request.documentType(),
+                maskValue(request.documentNumber())
+        );
+
+        return validateDocumentRequest(
+                    request.documentType(),
+                    request.documentNumber()
+                )
+                .then(findCustomerByDocument(
                         request.documentNumber(),
                         request.documentType()
                 ))
                 .flatMap(customerResponse ->
                         findActiveAccountsByCustomerId(customerResponse.id())
-                                .map(this::toBankAccountBalanceResponse)
+                                .map(accountMapper::toBankAccountBalanceResponse)
                                 .collectList()
                                 .map(accounts -> new AccountBalancesResponse(
                                         customerResponse.id(),
@@ -158,6 +408,33 @@ public class AccountServiceImpl implements AccountService {
                                         request.documentNumber(),
                                         accounts
                                 ))
+                )
+                .doOnSuccess(response ->
+                        log.info(
+                                "Account balances search completed. customerId={}, accountCount={}",
+                                response.customerId(),
+                                response.accounts().size()
+                        )
+                )
+                .doOnError(BusinessValidationException.class, error ->
+                        log.warn(
+                                "Account balances search rejected by validation. documentType={}, documentNumber={}",
+                                request.documentType(),
+                                maskValue(request.documentNumber())
+                        )
+                )
+                .doOnError(ResourceNotFoundException.class, error ->
+                        log.warn(
+                                "Account balances search rejected because customer was not found. documentType={}, documentNumber={}",
+                                request.documentType(),
+                                maskValue(request.documentNumber())
+                        )
+                )
+                .doOnError(error ->
+                        logUnexpectedError(
+                                "Unexpected error searching account balances",
+                                error
+                        )
                 );
     }
 
@@ -166,84 +443,153 @@ public class AccountServiceImpl implements AccountService {
             AccountTransactionsRequest request
     ) {
 
-        return validateAccountTransactionsRequest(request)
-                .then(client.getCustomerResponseByCustomer(
+        log.info(
+                "Starting account transactions search. documentType={}, documentNumber={}, accountNumber={}",
+                request.documentType(),
+                maskValue(request.documentNumber()),
+                maskValue(request.accountNumber())
+        );
+
+        return validateDocumentRequest(
+                    request.documentType(),
+                    request.documentNumber()
+                )
+                .then(getAccountAccessContext(
                         request.documentNumber(),
-                        request.documentType()
+                        request.documentType(),
+                        request.accountNumber(),
+                        List.of(ROLE_HOLDER, ROLE_AUTHORIZED_SIGNER),
+                        "Customer is not allowed to view transactions of this account"
                 ))
-                .flatMap(customerResponse ->
-                        accountRepository
-                                .findByAccountNumberAndStatus(
-                                        request.accountNumber(),
+                .flatMap(context ->
+                        transactionsRepository
+                                .findByAccountIdAndStatusOrderByTransactionDateDesc(
+                                        context.account().getAccountId(),
                                         true
                                 )
-                                .switchIfEmpty(Mono.error(new ResourceNotFoundException(
-                                        "Account",
-                                        "accountNumber",
-                                        request.accountNumber()
-                                )))
-                                .flatMap(account ->
-                                        validateCustomerCanViewAccountTransactions(
-                                                account,
-                                                customerResponse.id()
-                                        ).thenReturn(account)
-                                )
-                                .flatMap(account ->
-                                        transactionsRepository
-                                                .findByAccountIdAndStatusOrderByTransactionDateDesc(
-                                                        account.getAccountId(),
-                                                        true
-                                                )
-                                                .map(this::toTransactionResponse)
-                                                .collectList()
-                                                .map(transactions -> new
-                                                        AccountTransactionsResponse(
-                                                            customerResponse.id(),
-                                                            request.documentType(),
-                                                            request.documentNumber(),
-                                                            account.getAccountNumber(),
-                                                            account.getAccountType(),
-                                                            account.getBalance(),
-                                                            transactions
-                                                ))
-                                )
+                                .map(accountMapper::toTransactionResponse)
+                                .collectList()
+                                .map(transactions -> new AccountTransactionsResponse(
+                                        context.customer().id(),
+                                        request.documentType(),
+                                        request.documentNumber(),
+                                        context.account().getAccountNumber(),
+                                        context.account().getAccountType(),
+                                        context.account().getBalance(),
+                                        transactions
+                                ))
+                )
+                .doOnSuccess(response ->
+                        log.info(
+                                "Account transactions search completed. customerId={}, accountNumber={}, transactionCount={}",
+                                response.customerId(),
+                                maskValue(response.accountNumber()),
+                                response.transactions().size()
+                        )
+                )
+                .doOnError(BusinessValidationException.class, error ->
+                        log.warn(
+                                "Account transactions search rejected by validation. documentType={}, documentNumber={}, accountNumber={}",
+                                request.documentType(),
+                                maskValue(request.documentNumber()),
+                                maskValue(request.accountNumber())
+                        )
+                )
+                .doOnError(ResourceNotFoundException.class, error ->
+                        log.warn(
+                                "Account transactions search rejected because resource was not found. accountNumber={}",
+                                maskValue(request.accountNumber())
+                        )
+                )
+                .doOnError(error ->
+                        logUnexpectedError(
+                                "Unexpected error searching account transactions",
+                                error
+                        )
                 );
     }
 
     @Override
     public Mono<Void> deleteAccount(AccountDeleteRequest request) {
-        return validateDeleteAccountRequest(request)
-                .then(client.getCustomerResponseByCustomer(
-                        request.documentNumber(),
-                        request.documentType()
-                ))
-                .switchIfEmpty(Mono.error(new ResourceNotFoundException(
-                        "Customer",
-                        "documentNumber",
-                        request.documentNumber()
-                )))
-                .flatMap(customerResponse ->
-                        accountRepository
-                                .findByAccountNumberAndStatus(
-                                        request.accountNumber(),
-                                        true
-                                )
-                                .switchIfEmpty(Mono.error(new ResourceNotFoundException(
-                                        "Account",
-                                        "accountNumber",
-                                        request.accountNumber()
-                                )))
-                                .flatMap(account ->
-                                        validateCustomerCanDeleteAccount(
-                                                account,
-                                                customerResponse.id()
-                                        ).thenReturn(account)
-                                )
+
+        log.info(
+                "Starting logical account deletion. documentType={}, documentNumber={}, accountNumber={}",
+                request.documentType(),
+                maskValue(request.documentNumber()),
+                maskValue(request.accountNumber())
+        );
+
+
+        return validateDocumentRequest(
+                    request.documentType(),
+                    request.documentNumber()
                 )
-                .flatMap(this::deleteAccountAndParticipants);
+                .then(getAccountAccessContext(
+                        request.documentNumber(),
+                        request.documentType(),
+                        request.accountNumber(),
+                        List.of(ROLE_HOLDER),
+                        "Only account holder can delete this account"
+                ))
+                .map(AccountAccessContext::account)
+                .flatMap(this::deleteAccountAndParticipants)
+                .doOnSuccess(unused ->
+                        log.info(
+                                "Account logically deleted successfully. accountNumber={}",
+                                maskValue(request.accountNumber())
+                        )
+                )
+                .doOnError(BusinessValidationException.class, error ->
+                        log.warn(
+                                "Account deletion rejected by validation. documentType={}, documentNumber={}, accountNumber={}",
+                                request.documentType(),
+                                maskValue(request.documentNumber()),
+                                maskValue(request.accountNumber())
+                        )
+                )
+                .doOnError(ResourceNotFoundException.class, error ->
+                        log.warn(
+                                "Account deletion rejected because resource was not found. accountNumber={}",
+                                maskValue(request.accountNumber())
+                        )
+                )
+                .doOnError(error ->
+                        logUnexpectedError(
+                                "Unexpected error deleting account",
+                                error
+                        )
+                );
+
+    }
+
+    private Mono<Account> createAccountAndParticipant(
+            CustomerResponse customer,
+            AccountRequest accountRequest,
+            AccountValidationResult validationResult
+    ) {
+
+        Account account = accountFactory.create(accountRequest);
+
+        return accountRepository.save(account)
+                .flatMap(savedAccount ->
+                        createParticipants(
+                                savedAccount,
+                                customer,
+                                accountRequest,
+                                validationResult
+                        ).thenReturn(savedAccount)
+                );
     }
 
     private Mono<Void> deleteAccountAndParticipants(Account account) {
+
+
+        log.info(
+                "Disabling account and active participants. accountId={}, accountNumber={}",
+                account.getAccountId(),
+                maskValue(account.getAccountNumber())
+        );
+
 
         account.setStatus(false);
 
@@ -256,91 +602,14 @@ public class AccountServiceImpl implements AccountService {
                     participant.setStatus(false);
                     return accountParticipantRepository.save(participant);
                 })
-                .then();
-    }
-
-    private Mono<Void> validateDeleteAccountRequest(AccountDeleteRequest request) {
-
-        Map<String, String> errors = new HashMap<>();
-
-        validateDocument(
-                errors,
-                "documentType",
-                "documentNumber",
-                request.documentType(),
-                request.documentNumber()
-        );
-
-        if (!errors.isEmpty()) {
-            return Mono.error(new BusinessValidationException(errors));
-        }
-
-        return Mono.empty();
-    }
-
-    private Mono<Void> validateCustomerCanDeleteAccount(
-            Account account,
-            String customerId
-    ) {
-
-        return accountParticipantRepository
-                .existsByAccountIdAndCustomerIdAndParticipantRoleInAndStatus(
-                        account.getAccountId(),
-                        customerId,
-                        List.of("HOLDER"),
-                        true
-                )
-                .filter(Boolean::booleanValue)
-                .switchIfEmpty(Mono.error(new RuntimeException(
-                        "Only account holder can delete this account"
-                )))
-                .then();
-    }
-
-    private Mono<OperationCompleted> withDrawOperation(
-            OperationRequest operationRequest,
-            Account account,
-            String operation,
-            String customerId
-    ) {
-
-        BigDecimal currentBalance = account.getBalance() == null
-                ? BigDecimal.ZERO
-                : account.getBalance();
-
-        if (operationRequest.amount().compareTo(currentBalance) > 0) {
-            return Mono.error(new RuntimeException("Insufficient balance"));
-        }
-
-        account.setBalance(currentBalance.subtract(operationRequest.amount()));
-
-        return saveTransaction(
-                operationRequest,
-                account,
-                operation,
-                customerId
-        );
-    }
-
-    private Mono<OperationCompleted> depositOperation(
-            OperationRequest operationRequest,
-            Account account,
-            String operation,
-            String customerId
-    ) {
-
-        BigDecimal currentBalance = account.getBalance() == null
-                ? BigDecimal.ZERO
-                : account.getBalance();
-
-        account.setBalance(currentBalance.add(operationRequest.amount()));
-
-        return saveTransaction(
-                operationRequest,
-                account,
-                operation,
-                customerId
-        );
+                .then()
+                .doOnSuccess(unused ->
+                        log.info(
+                                "Account and active participants disabled successfully. accountId={}, accountNumber={}",
+                                account.getAccountId(),
+                                maskValue(account.getAccountNumber())
+                        )
+                );
     }
 
     private Mono<OperationCompleted> saveTransaction(
@@ -350,9 +619,17 @@ public class AccountServiceImpl implements AccountService {
             String customerId
     ) {
 
+        log.info(
+                "Saving account transaction. operation={}, accountId={}, accountNumber={}, customerId={}",
+                operation,
+                account.getAccountId(),
+                maskValue(account.getAccountNumber()),
+                customerId
+        );
+
         return accountRepository.save(account)
                 .flatMap(accountSaved -> {
-                    Transaction transaction = buildTransaction(
+                    Transaction transaction = transactionFactory.create(
                             operationRequest,
                             accountSaved,
                             operation,
@@ -361,34 +638,22 @@ public class AccountServiceImpl implements AccountService {
 
                     return transactionsRepository.save(transaction);
                 })
-                .map(transaction -> OperationCompleted.builder()
-                        .accountId(transaction.getAccountId())
-                        .customerId(transaction.getCustomerId())
-                        .operation(operation)
-                        .transactionDate(transaction.getTransactionDate())
-                        .amount(transaction.getAmount())
-                        .build()
+                .doOnSuccess(transaction ->
+                        log.info(
+                                "Transaction saved successfully. transactionId={}, operation={}, accountId={}, customerId={}",
+                                transaction.getTransactionId(),
+                                operation,
+                                transaction.getAccountId(),
+                                transaction.getCustomerId()
+                        )
+                )
+                .map(transaction ->  transactionFactory.toOperationCompleted(
+                                transaction,
+                                operation
+                        )
                 );
     }
 
-    private Transaction buildTransaction(
-            OperationRequest operationRequest,
-            Account account,
-            String operation,
-            String customerId
-    ) {
-
-        return Transaction.builder()
-                .accountId(account.getAccountId())
-                .accountNumber(account.getAccountNumber())
-                .customerId(customerId)
-                .documentNumber(operationRequest.documentNumber())
-                .transactionType(operation)
-                .amount(operationRequest.amount())
-                .transactionDate(LocalDateTime.now())
-                .status(true)
-                .build();
-    }
 
     private Mono<AccountValidationResult> validateAccountByCustomerType(
             CustomerResponse customerResponse,
@@ -495,48 +760,6 @@ public class AccountServiceImpl implements AccountService {
                 });
     }
 
-    private Mono<Account> createAccountAndParticipant(
-            CustomerResponse customer,
-            AccountRequest accountRequest,
-            AccountValidationResult validationResult
-    ) {
-
-        Account account = Account.builder()
-                .accountNumber(accountNumberGenerator.generate())
-                .accountType(normalize(accountRequest.accountType()))
-                .balance(accountRequest.initialAmount())
-                .status(true)
-                .openingDate(LocalDateTime.now())
-                .flagFreeCommisionMant(accountRequest.flagFreeCommisionMant())
-                .maxMovMon(accountRequest.maxMovMon())
-                .initialDate(resolveFixedTermInitialDate(accountRequest))
-                .cantDays(accountRequest.cantDays())
-                .build();
-
-        return accountRepository.save(account)
-                .flatMap(savedAccount ->
-                        createParticipants(
-                                savedAccount,
-                                customer,
-                                accountRequest,
-                                validationResult
-                        ).thenReturn(savedAccount)
-                );
-    }
-
-    private LocalDateTime resolveFixedTermInitialDate(AccountRequest accountRequest) {
-
-        if (!ACCOUNT_TYPE_FIXED_TERM.equals(normalize(accountRequest.accountType()))) {
-            return null;
-        }
-
-        LocalDate date = LocalDate.parse(
-                accountRequest.initialDate(),
-                FIXED_TERM_DATE_FORMATTER
-        );
-
-        return date.atStartOfDay();
-    }
 
     private Mono<Void> createParticipants(
             Account savedAccount,
@@ -569,7 +792,7 @@ public class AccountServiceImpl implements AccountService {
             CustomerResponse mainCustomer
     ) {
 
-        AccountParticipant participant = buildParticipant(
+        AccountParticipant participant = accountParticipantFactory.create(
                 savedAccount.getAccountId(),
                 mainCustomer.id(),
                 ROLE_HOLDER
@@ -587,11 +810,12 @@ public class AccountServiceImpl implements AccountService {
 
         List<AccountParticipant> participantsToSave = new ArrayList<>();
 
-        AccountParticipant mainHolder = buildParticipant(
+        AccountParticipant mainHolder = accountParticipantFactory.create(
                 savedAccount.getAccountId(),
                 mainCustomer.id(),
                 ROLE_HOLDER
         );
+
 
         participantsToSave.add(mainHolder);
 
@@ -622,70 +846,16 @@ public class AccountServiceImpl implements AccountService {
                 ));
             }
 
-            AccountParticipant participant = buildParticipant(
+            AccountParticipant participant = accountParticipantFactory.create(
                     savedAccount.getAccountId(),
                     participantCustomer.id(),
-                    normalize(participantRequest.participantRole())
+                    participantRequest.participantRole()
             );
 
             participantsToSave.add(participant);
         }
 
         return accountParticipantRepository.saveAll(participantsToSave).then();
-    }
-
-    private AccountParticipant buildParticipant(
-            String accountId,
-            String customerId,
-            String participantRole
-    ) {
-
-        AccountParticipant participant = new AccountParticipant();
-        participant.setAccountId(accountId);
-        participant.setCustomerId(customerId);
-        participant.setParticipantRole(normalize(participantRole));
-        participant.setRegistrationDate(LocalDateTime.now());
-        participant.setStatus(true);
-
-        return participant;
-    }
-
-    private Mono<Void> validateCustomerCanOperateAccount(
-            Account account,
-            String customerId
-    ) {
-
-        return accountParticipantRepository
-                .existsByAccountIdAndCustomerIdAndParticipantRoleInAndStatus(
-                        account.getAccountId(),
-                        customerId,
-                        List.of(ROLE_HOLDER, ROLE_AUTHORIZED_SIGNER),
-                        true
-                )
-                .filter(Boolean::booleanValue)
-                .switchIfEmpty(Mono.error(new RuntimeException(
-                        "Customer is not allowed to operate this account"
-                )))
-                .then();
-    }
-
-    private Mono<Void> validateCustomerCanViewAccountTransactions(
-            Account account,
-            String customerId
-    ) {
-
-        return accountParticipantRepository
-                .existsByAccountIdAndCustomerIdAndParticipantRoleInAndStatus(
-                        account.getAccountId(),
-                        customerId,
-                        List.of(ROLE_HOLDER, ROLE_AUTHORIZED_SIGNER),
-                        true
-                )
-                .filter(Boolean::booleanValue)
-                .switchIfEmpty(Mono.error(new RuntimeException(
-                        "Customer is not allowed to view transactions of this account"
-                )))
-                .then();
     }
 
     private Flux<Account> findActiveAccountsByCustomerId(String customerId) {
@@ -719,53 +889,7 @@ public class AccountServiceImpl implements AccountService {
                 request.documentNumber()
         );
 
-        validateAccountType(errors, request.accountType());
-        validateInitialAmount(errors, request.initialAmount());
-
         validateParticipants(errors, request);
-
-        if (!errors.isEmpty()) {
-            return Mono.error(new BusinessValidationException(errors));
-        }
-
-        return Mono.empty();
-    }
-
-    private Mono<Void> validateBalanceRequest(BalanceRequest request) {
-
-        Map<String, String> errors = new HashMap<>();
-
-        validateDocument(
-                errors,
-                "documentType",
-                "documentNumber",
-                request.documentType(),
-                request.documentNumber()
-        );
-
-        if (!errors.isEmpty()) {
-            return Mono.error(new BusinessValidationException(errors));
-        }
-
-        return Mono.empty();
-    }
-
-    private Mono<Void> validateAccountTransactionsRequest(
-            AccountTransactionsRequest request
-    ) {
-
-        Map<String, String> errors = new HashMap<>();
-
-
-        validateDocument(
-                errors,
-                "documentType",
-                "documentNumber",
-                request.documentType(),
-                request.documentNumber()
-        );
-
-
 
         if (!errors.isEmpty()) {
             return Mono.error(new BusinessValidationException(errors));
@@ -791,21 +915,30 @@ public class AccountServiceImpl implements AccountService {
         );
 
 
-        if (idOperation == null || idOperation.isBlank()) {
-            errors.put("operation", "Operation is required");
-        } else {
-            String operation = normalize(idOperation);
-
-            if (!List.of(OPERATION_DEPOSIT, OPERATION_WITHDRAW).contains(operation)) {
-                errors.put("operation", "Operation must be DEPOSIT or WITHDRAW");
-            }
-        }
+        validateOperation(errors, idOperation);
 
         if (!errors.isEmpty()) {
             return Mono.error(new BusinessValidationException(errors));
         }
 
         return Mono.empty();
+    }
+
+    private void validateOperation(
+            Map<String, String> errors,
+            String idOperation
+    ) {
+
+        if (idOperation == null || idOperation.isBlank()) {
+            errors.put("operation", "Operation is required");
+            return;
+        }
+
+        String operation = normalize(idOperation);
+
+        if (!List.of(OPERATION_DEPOSIT, OPERATION_WITHDRAW).contains(operation)) {
+            errors.put("operation", "Operation must be DEPOSIT or WITHDRAW");
+        }
     }
 
     private void validateParticipants(
@@ -840,25 +973,40 @@ public class AccountServiceImpl implements AccountService {
                     participant.documentNumber()
             );
 
+
+            validateDuplicatedParticipantDocument(
+                    errors,
+                    prefix,
+                    documentNumbers,
+                    participant.documentNumber()
+            );
+
             validateParticipantRole(
                     errors,
                     prefix + ".participantRole",
                     participant.participantRole()
             );
+        }
+    }
 
-            if (participant.documentNumber() != null
-                    && !participant.documentNumber().isBlank()) {
+    private void validateDuplicatedParticipantDocument(
+            Map<String, String> errors,
+            String prefix,
+            Set<String> documentNumbers,
+            String documentNumber
+    ) {
 
-                String participantDocumentNumber =
-                        normalizeText(participant.documentNumber());
+        if (documentNumber == null || documentNumber.isBlank()) {
+            return;
+        }
 
-                if (!documentNumbers.add(participantDocumentNumber)) {
-                    errors.put(
-                            prefix + ".documentNumber",
-                            "Participant document number must not be duplicated or equal to the main customer document number"
-                    );
-                }
-            }
+        String cleanDocumentNumber = normalizeText(documentNumber);
+
+        if (!documentNumbers.add(cleanDocumentNumber)) {
+            errors.put(
+                    prefix + ".documentNumber",
+                    "Participant document number must not be duplicated or equal to the main customer document number"
+            );
         }
     }
 
@@ -910,44 +1058,6 @@ public class AccountServiceImpl implements AccountService {
         }
     }
 
-    private void validateAccountType(
-            Map<String, String> errors,
-            String accountType
-    ) {
-
-        if (accountType == null || accountType.isBlank()) {
-            errors.put("accountType", "Account type is required");
-            return;
-        }
-
-        String cleanAccountType = normalize(accountType);
-
-        if (!List.of(
-                ACCOUNT_TYPE_SAVINGS,
-                ACCOUNT_TYPE_CHECKING,
-                ACCOUNT_TYPE_FIXED_TERM
-        ).contains(cleanAccountType)) {
-            errors.put(
-                    "accountType",
-                    "Account type must be 01 for SAVINGS, 02 for CHECKING or 03 for FIXED_TERM"
-            );
-        }
-    }
-
-    private void validateInitialAmount(
-            Map<String, String> errors,
-            BigDecimal initialAmount
-    ) {
-
-        if (initialAmount == null) {
-            errors.put("initialAmount", "Initial amount is required");
-            return;
-        }
-
-        if (initialAmount.compareTo(BigDecimal.ZERO) < 0) {
-            errors.put("initialAmount", "Initial amount cannot be negative");
-        }
-    }
 
     private void validateParticipantRole(
             Map<String, String> errors,
@@ -970,57 +1080,15 @@ public class AccountServiceImpl implements AccountService {
         }
     }
 
-    private AccountResponse toAccountResponse(Account account) {
-
-        return AccountResponse.builder()
-                .accountId(account.getAccountId())
-                .accountNumber(account.getAccountNumber())
-                .accountType(account.getAccountType())
-                .balance(account.getBalance())
-                .openingDate(account.getOpeningDate())
-                .flagFreeCommisionMant(account.getFlagFreeCommisionMant())
-                .maxMovMon(account.getMaxMovMon())
-                .initialDate(account.getInitialDate())
-                .status(account.getStatus())
-                .build();
-    }
-
-    private BankAccountBalanceResponse toBankAccountBalanceResponse(Account account) {
-
-        return new BankAccountBalanceResponse(
-                account.getAccountNumber(),
-                account.getAccountType(),
-                account.getBalance(),
-                CURRENCY_TYPE_PEN,
-                CURRENCY_NAME_SOLES,
-                account.getStatus()
-        );
-    }
-
-    private TransactionResponse toTransactionResponse(Transaction transaction) {
-
-        return new TransactionResponse(
-                transaction.getTransactionId(),
-                transaction.getAccountNumber(),
-                transaction.getDocumentNumber(),
-                transaction.getTransactionType(),
-                transaction.getAmount(),
-                transaction.getTransactionDate(),
-                transaction.getStatus()
-        );
-    }
-
     private List<AccountParticipantRequest> getSafeParticipants(
             AccountRequest request
     ) {
-
         return request.participants() == null
                 ? List.of()
                 : request.participants();
     }
 
     private String getAccountTypeName(String accountType) {
-
         return switch (accountType) {
             case ACCOUNT_TYPE_SAVINGS -> "SAVINGS";
             case ACCOUNT_TYPE_CHECKING -> "CHECKING";
@@ -1030,18 +1098,46 @@ public class AccountServiceImpl implements AccountService {
     }
 
     private String normalize(String value) {
-
         return value == null
                 ? ""
                 : value.trim().toUpperCase();
     }
 
     private String normalizeText(String value) {
-
         return value == null
                 ? ""
                 : value.trim();
     }
 
+    private String maskValue(String value) {
+
+        if (value == null || value.isBlank()) {
+            return "EMPTY";
+        }
+
+        String cleanValue = value.trim();
+
+        if (cleanValue.length() <= 4) {
+            return "****";
+        }
+
+        return "****" + cleanValue.substring(cleanValue.length() - 4);
+    }
+
+    private void logUnexpectedError(String message, Throwable error) {
+
+        if (error instanceof BusinessValidationException
+                || error instanceof ResourceNotFoundException) {
+            return;
+        }
+
+        log.error(message, error);
+    }
+
+    private record AccountAccessContext(
+            CustomerResponse customer,
+            Account account
+    ) {
+    }
 
 }
